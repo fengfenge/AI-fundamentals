@@ -37,13 +37,13 @@ TP = Tensor Parallelism，张量并行。
 这 4 张 GPU 组成一个 TP 组 / TP rank group。每一张卡只算一部分，然后通过集合通信把结果合并。
 
 常见并行策略对比：
-
+```
 缩写	全称	                  含义	                通信频率
 TP	Tensor Parallelism	  张量并行，切单层张量	    极高，每层都通信
 PP	Pipeline Parallelism	流水线并行，切模型层	    中等，阶段间传激活
 DP	Data Parallelism	    数据并行，复制模型切数据	较低，梯度同步
 EP	Expert Parallelism	  专家并行，MoE 专家分布	   高，All-to-All
-
+```
 
 ```
 Y = X @ W
