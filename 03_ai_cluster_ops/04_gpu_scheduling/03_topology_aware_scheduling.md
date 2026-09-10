@@ -8,6 +8,8 @@
 
 ## 一、GPU 亲和性——NVLink 域内 vs 跨 NVSwitch
 
+NVSwitch 域关注 GPU-GPU 距离
+
 同一个节点上 8 张 A100/H100 通过 NVSwitch 全互联。任意两张 GPU 都能达到 NVLink 最高带宽（H100: ~450 GB/s 理论单向带宽，NCCL all_reduce 实测 bus_bw ~316 GB/s；A100: ~600 GB/s 双向）。但如果 4 张 GPU 分别来自两个 NVSwitch 域（A100 有 2 个 NVSwitch，每 4 张 GPU 一组），跨域通信需要经过 PCIe 中转：
 
 ```text
@@ -18,6 +20,42 @@ NVSwitch 域 1 (GPU 0-3):         NVSwitch 域 2 (GPU 4-7):
 ```
 
 调度器的任务是：为 TP=4 的作业分配 4 张 GPU 时，优先选择**全部在同一个 NVSwitch 域内**的 GPU 组。
+
+```
+NVSwitch域内，GPU之间NVLink互联架构：带宽很高，比如 H100 级别每卡 NVLink 可达数百 GB/s，延迟很低。
+GPU0 ── GPU1
+ │  \  /  │
+ │   NV   │
+ │  /  \  │
+GPU3 ── GPU2
+```
+
+
+TP = Tensor Parallelism，张量并行。
+在分布式训练 / 推理里，TP=4 表示：
+这个作业把同一个模型层、同一个张量计算，切分到 4 张 GPU 上协同完成。
+这 4 张 GPU 组成一个 TP 组 / TP rank group。每一张卡只算一部分，然后通过集合通信把结果合并。
+
+常见并行策略对比：
+
+缩写	全称	                  含义	                通信频率
+TP	Tensor Parallelism	  张量并行，切单层张量	    极高，每层都通信
+PP	Pipeline Parallelism	流水线并行，切模型层	    中等，阶段间传激活
+DP	Data Parallelism	    数据并行，复制模型切数据	较低，梯度同步
+EP	Expert Parallelism	  专家并行，MoE 专家分布	   高，All-to-All
+
+
+```
+Y = X @ W
+TP=4 时，可能把权重 W 按列切成 4 份:
+W = [W0, W1, W2, W3]
+4 张 GPU 分别计算：
+Y0 = X @ W0
+Y1 = X @ W1
+Y2 = X @ W2
+Y3 = X @ W3
+再通过 AllReduce、AllGather 或 ReduceScatter 合并成完整结果
+```
 
 ### 1.1 实现方式
 
@@ -53,7 +91,19 @@ spec:
 
 ## 二、NUMA 亲和性——GPU 离哪个 CPU 更近
 
+NUMA 亲和性关注 CPU-GPU 距离
+
+NUMA 是单台服务器内部的拓扑概念，不是多台服务器之间的概念。每个 NUMA 节点包含: CPU 核心 + 直连的本地内存 + 本地 PCIe 控制器。
+多台服务器之间通过网络互联，那叫集群 / 分布式系统，不叫 NUMA。NUMA 里的“节点”是单机内部的 CPU + 内存分组，和集群里的“节点”不是一回事。
+CPU 访问自己节点的内存快；访问另一个节点的内存慢，因为要走 CPU 之间的互连，比如 UPI、Infinity Fabric。
+真正定义 NUMA 节点的是：哪些 CPU 核心和哪块本地内存、哪些 PCIe 设备离得更近。通常 node0 对应 socket0
 GPU 通过 PCIe 连接到特定的 NUMA node。H2D 传输时，如果 CPU 线程和 GPU 不在同一个 NUMA node，数据需要跨 QPI/UPI 传输，延迟翻倍：
+
+```
+numactl -H
+lscpu | grep -i numa
+nvidia-smi topo -m #nvidia-smi topo -m 可以看 GPU 挂在哪个 NUMA 节点，也就是“GPU 离哪个 CPU 更近”
+```
 
 ```text
 2-socket 服务器 (Intel Xeon):
@@ -65,7 +115,39 @@ GPU 通过 PCIe 连接到特定的 NUMA node。H2D 传输时，如果 CPU 线程
   CPU 0-23        CPU 24-47   ← CPU core 也绑定到 NUMA node
 
 错误: GPU 0 (NUMA 0) + CPU 24 (NUMA 1) → H2D 跨 QPI，~2 倍延迟
+数据要先跨 CPU 互连，再走 PCIe 到 GPU，所以延迟更高，带宽也可能下降。
+
 正确: GPU 0 (NUMA 0) + CPU 0  (NUMA 0) → H2D 本地，最优延迟
+CPU 0 在 NUMA 0
+GPU 0 也在 NUMA 0
+host 内存在 NUMA 0
+NUMA 0 本地内存
+        ↓ PCIe
+GPU 0 显存
+
+实际使用建议：
+CUDA_VISIBLE_DEVICES=0 numactl --cpunodebind=0 --membind=0 python train.py
+```
+
+H2D = Host to Device，意思是：从主机内存拷贝到 GPU 显存。
+在 CUDA 里就是：
+cuda
+cudaMemcpy(dst_gpu, src_cpu, size, cudaMemcpyHostToDevice);
+Host：CPU + 系统内存 RAM
+Device：GPU + 显存 VRAM
+H2D 方向：CPU 内存 → PCIe → GPU 显存
+
+对应的还有：
+缩写	含义	          方向
+H2D	Host to Device	  主机内存 → GPU 显存
+D2H	Device to Host	  GPU 显存 → 主机内存
+D2D	Device to Device	GPU 显存 → GPU 显存
+H2H	Host to Host	    主机内存 → 主机内存
+在 PyTorch 里，这些都会触发 H2D：
+
+```python
+x = torch.randn(1024, 1024)   # CPU 内存
+x = x.cuda()                  # H2D：CPU 内存 -> GPU 显存
 ```
 
 调度器应在 Score 阶段为 CPU 和 GPU 在同一个 NUMA node 的分配赋予更高分。
