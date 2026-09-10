@@ -94,9 +94,13 @@ spec:
 NUMA 亲和性关注 CPU-GPU 距离
 
 NUMA 是单台服务器内部的拓扑概念，不是多台服务器之间的概念。每个 NUMA 节点包含: CPU 核心 + 直连的本地内存 + 本地 PCIe 控制器。
+
 多台服务器之间通过网络互联，那叫集群 / 分布式系统，不叫 NUMA。NUMA 里的“节点”是单机内部的 CPU + 内存分组，和集群里的“节点”不是一回事。
+
 CPU 访问自己节点的内存快；访问另一个节点的内存慢，因为要走 CPU 之间的互连，比如 UPI、Infinity Fabric。
+
 真正定义 NUMA 节点的是：哪些 CPU 核心和哪块本地内存、哪些 PCIe 设备离得更近。通常 node0 对应 socket0
+
 GPU 通过 PCIe 连接到特定的 NUMA node。H2D 传输时，如果 CPU 线程和 GPU 不在同一个 NUMA node，数据需要跨 QPI/UPI 传输，延迟翻倍：
 
 ```
@@ -131,18 +135,23 @@ CUDA_VISIBLE_DEVICES=0 numactl --cpunodebind=0 --membind=0 python train.py
 
 H2D = Host to Device，意思是：从主机内存拷贝到 GPU 显存。
 在 CUDA 里就是：
+```
 cuda
 cudaMemcpy(dst_gpu, src_cpu, size, cudaMemcpyHostToDevice);
 Host：CPU + 系统内存 RAM
 Device：GPU + 显存 VRAM
 H2D 方向：CPU 内存 → PCIe → GPU 显存
+```
 
 对应的还有：
+```
 缩写	含义	          方向
 H2D	Host to Device	  主机内存 → GPU 显存
 D2H	Device to Host	  GPU 显存 → 主机内存
 D2D	Device to Device	GPU 显存 → GPU 显存
 H2H	Host to Host	    主机内存 → 主机内存
+```
+
 在 PyTorch 里，这些都会触发 H2D：
 
 ```python
